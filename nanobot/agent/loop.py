@@ -33,8 +33,10 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.progress import build_bus_progress_callback
 from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import (
+    McpServerStatusChanged,
     RuntimeEventBus,
     RuntimeEventPublisher,
+    StartupActivity,
     ensure_runtime_event_publisher,
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
@@ -261,6 +263,7 @@ class AgentLoop:
         self.workspace_scopes = WorkspaceScopeResolver(
             default_workspace=workspace,
             default_restrict_to_workspace=restrict_to_workspace,
+            scoped_channels={"websocket", "cli"},
         )
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
@@ -502,7 +505,33 @@ class AgentLoop:
 
     async def _connect_mcp(self) -> None:
         """Connect configured MCP servers."""
+        publisher = self._runtime_events().bus
+        for name in sorted(self._mcp_servers):
+            await publisher.publish(McpServerStatusChanged(server=name, status="connecting"))
+        await publisher.publish(
+            StartupActivity(
+                component="mcp",
+                phase="connecting",
+                details={"configured": sorted(self._mcp_servers)},
+            )
+        )
         await agent_context.connect_mcp(self, self.tools)
+        connected = sorted(self._mcp_stacks)
+        configured = sorted(self._mcp_servers)
+        for name in configured:
+            await publisher.publish(
+                McpServerStatusChanged(
+                    server=name,
+                    status="connected" if name in self._mcp_stacks else "failed",
+                )
+            )
+        await publisher.publish(
+            StartupActivity(
+                component="mcp",
+                phase="connected" if len(connected) == len(configured) else "partial",
+                details={"configured": configured, "connected": connected},
+            )
+        )
 
     def _set_tool_context(
         self, channel: str, chat_id: str,
@@ -1745,6 +1774,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         media: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
@@ -1755,7 +1785,7 @@ class AgentLoop:
         await self._connect_mcp()
         msg = InboundMessage(
             channel=channel, sender_id="user", chat_id=chat_id,
-            content=content, media=media or [],
+            content=content, media=media or [], metadata=dict(metadata or {}),
         )
         # Share the dispatch lock so direct calls serialize with bus turns.
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
